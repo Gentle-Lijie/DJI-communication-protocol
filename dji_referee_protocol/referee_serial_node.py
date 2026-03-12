@@ -38,13 +38,7 @@ from geometry_msgs.msg import Point, Pose, PoseStamped
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 
 # 尝试导入串口库
-try:
-    import serial
-    import serial.tools.list_ports
-    SERIAL_AVAILABLE = True
-except ImportError:
-    SERIAL_AVAILABLE = False
-    print("警告：pyserial未安装，串口功能将不可用")
+import serial
 
 # 本地模块导入
 from .protocol_constants import CommandID, SerialConfig
@@ -81,18 +75,23 @@ class RefereeSerialNode(Node):
         # ==================== 声明参数 ====================
         self.declare_parameter('serial_port_normal', '/dev/ttyUSB0')
         self.declare_parameter('serial_port_video', '/dev/ttyUSB1')
-        self.declare_parameter('serial_baud_normal', SerialConfig.NORMAL_BAUDRATE)
-        self.declare_parameter('serial_baud_video', SerialConfig.VIDEO_TRANSMISSION_BAUDRATE)
+        self.declare_parameter('serial_baud_normal',
+                               SerialConfig.NORMAL_BAUDRATE)
+        self.declare_parameter('serial_baud_video',
+                               SerialConfig.VIDEO_TRANSMISSION_BAUDRATE)
         self.declare_parameter('config_file', '')
         self.declare_parameter('publish_all_topics', True)
 
         # 获取参数
-        self.serial_port_normal = self.get_parameter('serial_port_normal').value
+        self.serial_port_normal = self.get_parameter(
+            'serial_port_normal').value
         self.serial_port_video = self.get_parameter('serial_port_video').value
-        self.serial_baud_normal = self.get_parameter('serial_baud_normal').value
+        self.serial_baud_normal = self.get_parameter(
+            'serial_baud_normal').value
         self.serial_baud_video = self.get_parameter('serial_baud_video').value
         self.config_file = self.get_parameter('config_file').value
-        self.publish_all_topics = self.get_parameter('publish_all_topics').value
+        self.publish_all_topics = self.get_parameter(
+            'publish_all_topics').value
 
         # ==================== 初始化协议解析器 ====================
         self.parser_normal = ProtocolParser()
@@ -127,8 +126,10 @@ class RefereeSerialNode(Node):
         self._start_read_threads()
 
         self.get_logger().info('裁判系统串口读取节点已启动')
-        self.get_logger().info(f'常规链路串口: {self.serial_port_normal} @ {self.serial_baud_normal}')
-        self.get_logger().info(f'图传链路串口: {self.serial_port_video} @ {self.serial_baud_video}')
+        self.get_logger().info(
+            f'常规链路串口: {self.serial_port_normal} @ {self.serial_baud_normal}')
+        self.get_logger().info(
+            f'图传链路串口: {self.serial_port_video} @ {self.serial_baud_video}')
 
     def _load_topic_config(self) -> Dict[str, bool]:
         """
@@ -193,15 +194,12 @@ class RefereeSerialNode(Node):
 
         尝试打开配置的串口设备。如果失败，记录警告但不会退出。
         """
-        if not SERIAL_AVAILABLE:
-            self.get_logger().warn('pyserial未安装，串口功能不可用')
-            return
-
         # 初始化常规链路串口
         try:
             self.serial_normal = serial.Serial(
                 port=self.serial_port_normal,
-                baudrate=self.serial_baud_normal,
+                baudrate=int(
+                    self.serial_baud_normal) if self.serial_baud_normal is not None else SerialConfig.NORMAL_BAUDRATE,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
@@ -209,13 +207,15 @@ class RefereeSerialNode(Node):
             )
             self.get_logger().info(f'已打开常规链路串口: {self.serial_port_normal}')
         except serial.SerialException as e:
-            self.get_logger().warn(f'无法打开常规链路串口 {self.serial_port_normal}: {e}')
+            self.get_logger().warn(
+                f'无法打开常规链路串口 {self.serial_port_normal}: {e}')
 
         # 初始化图传链路串口
         try:
             self.serial_video = serial.Serial(
                 port=self.serial_port_video,
-                baudrate=self.serial_baud_video,
+                baudrate=int(
+                    self.serial_baud_video) if self.serial_baud_video is not None else SerialConfig.VIDEO_TRANSMISSION_BAUDRATE,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
@@ -309,7 +309,8 @@ class RefereeSerialNode(Node):
         while self.running and self.serial_normal:
             try:
                 if self.serial_normal.in_waiting > 0:
-                    data = self.serial_normal.read(self.serial_normal.in_waiting)
+                    data = self.serial_normal.read(
+                        self.serial_normal.in_waiting)
                     self.parser_normal.feed_data(data)
 
                     # 尝试解包数据
