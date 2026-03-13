@@ -34,6 +34,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import Header
+from std_msgs.msg import Float32MultiArray
 from geometry_msgs.msg import Point, Pose, PoseStamped
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 
@@ -81,6 +82,12 @@ class RefereeSerialNode(Node):
                                SerialConfig.VIDEO_TRANSMISSION_BAUDRATE)
         self.declare_parameter('config_file', '')
         self.declare_parameter('publish_all_topics', True)
+        self.declare_parameter(
+            'referee_constraint_topic', '/referee/constraints')
+        self.declare_parameter('heat_lock_margin', 15.0)
+        self.declare_parameter('power_high_ratio', 0.9)
+        self.declare_parameter('power_hard_ratio', 1.0)
+        self.declare_parameter('min_speed_scale', 0.35)
 
         # 获取参数
         self.serial_port_normal = self.get_parameter(
@@ -92,6 +99,16 @@ class RefereeSerialNode(Node):
         self.config_file = self.get_parameter('config_file').value
         self.publish_all_topics = self.get_parameter(
             'publish_all_topics').value
+        self.referee_constraint_topic: str = str(
+            self.get_parameter('referee_constraint_topic').value or '/referee/constraints')
+        self.heat_lock_margin = float(
+            self.get_parameter('heat_lock_margin').value or 15.0)
+        self.power_high_ratio = float(
+            self.get_parameter('power_high_ratio').value or 0.9)
+        self.power_hard_ratio = float(
+            self.get_parameter('power_hard_ratio').value or 1.0)
+        self.min_speed_scale = float(
+            self.get_parameter('min_speed_scale').value or 0.35)
 
         # ==================== 初始化协议解析器 ====================
         self.parser_normal = ProtocolParser()
@@ -108,6 +125,15 @@ class RefereeSerialNode(Node):
         # ==================== 创建话题发布器 ====================
         self._publishers_dict: Dict[int, Any] = {}
         self._create_publishers()
+
+        # 裁判约束汇总发布器（供底盘/火控限幅与禁射）
+        self.constraint_pub = self.create_publisher(
+            Float32MultiArray, self.referee_constraint_topic, 10)
+
+        self.latest_shooter_heat = 0.0
+        self.latest_heat_limit = 0.0
+        self.latest_chassis_power = 0.0
+        self.latest_chassis_power_limit = 0.0
 
         # ==================== QoS配置 ====================
         # 使用可靠传输，保留最近10条消息
@@ -380,8 +406,60 @@ class RefereeSerialNode(Node):
             msg = self._create_ros_message(cmd_id, data, header)
             if msg:
                 self._publishers_dict[cmd_id].publish(msg)
+
+            # 更新并发布裁判约束
+            self._update_constraint_state(cmd_id, data)
         except Exception as e:
             self.get_logger().error(f'发布数据错误 (cmd_id=0x{cmd_id:04X}): {e}')
+
+    def _update_constraint_state(self, cmd_id: int, data: Any) -> None:
+        """根据裁判帧更新约束状态，并发布统一约束话题。"""
+        updated = False
+
+        if cmd_id == CommandID.ROBOT_PERFORMANCE:
+            self.latest_heat_limit = float(
+                getattr(data, 'shooter_barrel_heat_limit', 0.0))
+            self.latest_chassis_power_limit = float(
+                getattr(data, 'chassis_power_limit', 0.0))
+            updated = True
+        elif cmd_id == CommandID.ROBOT_HEAT:
+            self.latest_shooter_heat = float(
+                getattr(data, 'shooter_17mm_barrel_heat', 0.0))
+            self.latest_chassis_power = float(
+                getattr(data, 'chassis_current_power', 0.0))
+            updated = True
+
+        if not updated:
+            return
+
+        fire_allowed = True
+        if self.latest_heat_limit > 0.0:
+            fire_allowed = self.latest_shooter_heat < max(
+                0.0, self.latest_heat_limit - self.heat_lock_margin)
+        if self.latest_chassis_power_limit > 0.0 and self.latest_chassis_power > self.latest_chassis_power_limit:
+            fire_allowed = False
+
+        speed_scale = 1.0
+        if self.latest_chassis_power_limit > 0.0:
+            ratio = self.latest_chassis_power / self.latest_chassis_power_limit
+            if ratio >= self.power_hard_ratio:
+                speed_scale = self.min_speed_scale
+            elif ratio > self.power_high_ratio:
+                denom = max(1e-6, self.power_hard_ratio -
+                            self.power_high_ratio)
+                k = (ratio - self.power_high_ratio) / denom
+                speed_scale = 1.0 - k * (1.0 - self.min_speed_scale)
+
+        constraints = Float32MultiArray()
+        constraints.data = [
+            float(self.latest_shooter_heat),
+            float(self.latest_heat_limit),
+            float(self.latest_chassis_power),
+            float(self.latest_chassis_power_limit),
+            1.0 if fire_allowed else 0.0,
+            float(max(0.0, min(1.0, speed_scale))),
+        ]
+        self.constraint_pub.publish(constraints)
 
     def _create_ros_message(self, cmd_id: int, data: Any, header: Header) -> Optional[PoseStamped]:
         """
