@@ -32,9 +32,10 @@ from typing import Dict, Any, Optional
 # ROS 2 导入
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import Header
 from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import String
 from geometry_msgs.msg import Point, Pose, PoseStamped
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 
@@ -82,8 +83,12 @@ class RefereeSerialNode(Node):
                                SerialConfig.VIDEO_TRANSMISSION_BAUDRATE)
         self.declare_parameter('config_file', '')
         self.declare_parameter('publish_all_topics', True)
+        self.declare_parameter('serial_auto_baud_scan', True)
+        self.declare_parameter('serial_no_data_reopen_sec', 3.0)
         self.declare_parameter(
             'referee_constraint_topic', '/referee/constraints')
+        self.declare_parameter(
+            'referee_self_color_topic', '/referee/self_color')
         self.declare_parameter('heat_lock_margin', 15.0)
         self.declare_parameter('power_high_ratio', 0.9)
         self.declare_parameter('power_hard_ratio', 1.0)
@@ -99,8 +104,14 @@ class RefereeSerialNode(Node):
         self.config_file = self.get_parameter('config_file').value
         self.publish_all_topics = self.get_parameter(
             'publish_all_topics').value
+        self.serial_auto_baud_scan = bool(
+            self.get_parameter('serial_auto_baud_scan').value)
+        self.serial_no_data_reopen_sec = float(
+            self.get_parameter('serial_no_data_reopen_sec').value or 3.0)
         self.referee_constraint_topic: str = str(
             self.get_parameter('referee_constraint_topic').value or '/referee/constraints')
+        self.referee_self_color_topic: str = str(
+            self.get_parameter('referee_self_color_topic').value or '/referee/self_color')
         self.heat_lock_margin = float(
             self.get_parameter('heat_lock_margin').value or 15.0)
         self.power_high_ratio = float(
@@ -126,14 +137,42 @@ class RefereeSerialNode(Node):
         self._publishers_dict: Dict[int, Any] = {}
         self._create_publishers()
 
+        # 串口接收状态（用于无数据重连与自动波特率扫描）
+        self.last_normal_packet_time = time.monotonic()
+        self.last_normal_byte_time = time.monotonic()
+        self.normal_rx_bytes = 0
+        self.normal_rx_packets = 0
+        self.normal_baud_candidates = []
+        for b in [int(self.serial_baud_normal), SerialConfig.NORMAL_BAUDRATE, SerialConfig.VIDEO_TRANSMISSION_BAUDRATE]:
+            if b not in self.normal_baud_candidates:
+                self.normal_baud_candidates.append(b)
+        self.normal_baud_index = 0
+
         # 裁判约束汇总发布器（供底盘/火控限幅与禁射）
+        # 使用 transient_local，确保晚启动订阅者也能收到最近一次状态。
+        self.state_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.constraint_pub = self.create_publisher(
-            Float32MultiArray, self.referee_constraint_topic, 10)
+            Float32MultiArray, self.referee_constraint_topic, self.state_qos)
+        self.self_color_pub = self.create_publisher(
+            String, self.referee_self_color_topic, self.state_qos)
 
         self.latest_shooter_heat = 0.0
         self.latest_heat_limit = 0.0
         self.latest_chassis_power = 0.0
         self.latest_chassis_power_limit = 0.0
+        self.latest_robot_id = 0
+        self.latest_self_color = 'unknown'
+
+        # 状态周期发布定时器，避免晚订阅者长期读到unknown或空约束。
+        self.state_timer = self.create_timer(
+            1.0, self._publish_state_heartbeat)
+        self.serial_watchdog_timer = self.create_timer(
+            1.0, self._serial_watchdog_tick)
 
         # ==================== QoS配置 ====================
         # 使用可靠传输，保留最近10条消息
@@ -332,11 +371,18 @@ class RefereeSerialNode(Node):
 
         持续从常规链路串口读取数据并解析。
         """
-        while self.running and self.serial_normal:
+        while self.running:
             try:
+                if not self.serial_normal or not self.serial_normal.is_open:
+                    time.sleep(0.05)
+                    continue
+
                 if self.serial_normal.in_waiting > 0:
                     data = self.serial_normal.read(
                         self.serial_normal.in_waiting)
+                    if data:
+                        self.last_normal_byte_time = time.monotonic()
+                        self.normal_rx_bytes += len(data)
                     self.parser_normal.feed_data(data)
 
                     # 尝试解包数据
@@ -345,15 +391,59 @@ class RefereeSerialNode(Node):
                         if result is None:
                             break
                         cmd_id, parsed_data = result
+                        self.last_normal_packet_time = time.monotonic()
+                        self.normal_rx_packets += 1
                         self._publish_data(cmd_id, parsed_data)
 
                 time.sleep(0.001)  # 1ms间隔，避免CPU占用过高
 
             except serial.SerialException as e:
                 self.get_logger().error(f'常规链路串口读取错误: {e}')
-                break
+                time.sleep(0.1)
             except Exception as e:
                 self.get_logger().error(f'常规链路解析错误: {e}')
+
+    def _reopen_normal_serial(self, baud: int) -> None:
+        """重开常规链路串口并切换波特率。"""
+        try:
+            if self.serial_normal and self.serial_normal.is_open:
+                self.serial_normal.close()
+        except Exception:
+            pass
+
+        try:
+            self.serial_normal = serial.Serial(
+                port=self.serial_port_normal,
+                baudrate=baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=SerialConfig.TIMEOUT
+            )
+            self.serial_baud_normal = baud
+            self.last_normal_byte_time = time.monotonic()
+            self.last_normal_packet_time = time.monotonic()
+            self.get_logger().warn(
+                f'常规链路无有效数据，切换波特率重连: {self.serial_port_normal} @ {baud}')
+        except serial.SerialException as e:
+            self.get_logger().warn(
+                f'常规链路重连失败 {self.serial_port_normal} @ {baud}: {e}')
+            self.serial_normal = None
+
+    def _serial_watchdog_tick(self) -> None:
+        """串口看门狗：长时间无有效帧时自动重连并轮询波特率。"""
+        if not self.running or not self.serial_auto_baud_scan:
+            return
+
+        now = time.monotonic()
+        if now - self.last_normal_packet_time < self.serial_no_data_reopen_sec:
+            return
+
+        # 如果最近连字节都没有，依然尝试重开（设备可能瞬断后恢复）
+        self.normal_baud_index = (
+            self.normal_baud_index + 1) % len(self.normal_baud_candidates)
+        next_baud = self.normal_baud_candidates[self.normal_baud_index]
+        self._reopen_normal_serial(next_baud)
 
     def _read_serial_video(self) -> None:
         """
@@ -393,22 +483,20 @@ class RefereeSerialNode(Node):
             cmd_id: 命令码ID
             data: 解析后的数据对象
         """
-        if cmd_id not in self._publishers_dict:
-            return
-
         try:
-            # 创建消息头
-            header = Header()
-            header.stamp = self.get_clock().now().to_msg()
-            header.frame_id = 'referee'
-
-            # 根据数据类型创建对应的ROS消息
-            msg = self._create_ros_message(cmd_id, data, header)
-            if msg:
-                self._publishers_dict[cmd_id].publish(msg)
-
             # 更新并发布裁判约束
             self._update_constraint_state(cmd_id, data)
+
+            if cmd_id in self._publishers_dict:
+                # 创建消息头
+                header = Header()
+                header.stamp = self.get_clock().now().to_msg()
+                header.frame_id = 'referee'
+
+                # 根据数据类型创建对应的ROS消息
+                msg = self._create_ros_message(cmd_id, data, header)
+                if msg:
+                    self._publishers_dict[cmd_id].publish(msg)
         except Exception as e:
             self.get_logger().error(f'发布数据错误 (cmd_id=0x{cmd_id:04X}): {e}')
 
@@ -417,10 +505,12 @@ class RefereeSerialNode(Node):
         updated = False
 
         if cmd_id == CommandID.ROBOT_PERFORMANCE:
+            self.latest_robot_id = int(getattr(data, 'robot_id', 0))
             self.latest_heat_limit = float(
                 getattr(data, 'shooter_barrel_heat_limit', 0.0))
             self.latest_chassis_power_limit = float(
                 getattr(data, 'chassis_power_limit', 0.0))
+            self._publish_self_color_from_robot_id(self.latest_robot_id)
             updated = True
         elif cmd_id == CommandID.ROBOT_HEAT:
             self.latest_shooter_heat = float(
@@ -450,6 +540,9 @@ class RefereeSerialNode(Node):
                 k = (ratio - self.power_high_ratio) / denom
                 speed_scale = 1.0 - k * (1.0 - self.min_speed_scale)
 
+        self._publish_constraints(fire_allowed, speed_scale)
+
+    def _publish_constraints(self, fire_allowed: bool, speed_scale: float) -> None:
         constraints = Float32MultiArray()
         constraints.data = [
             float(self.latest_shooter_heat),
@@ -460,6 +553,46 @@ class RefereeSerialNode(Node):
             float(max(0.0, min(1.0, speed_scale))),
         ]
         self.constraint_pub.publish(constraints)
+
+    def _publish_self_color_from_robot_id(self, robot_id: int) -> None:
+        """根据机器人ID发布自车颜色。"""
+        if 1 <= robot_id < 100:
+            color = 'red'
+        elif 100 <= robot_id < 200:
+            color = 'blue'
+        else:
+            color = 'unknown'
+
+        self.latest_self_color = color
+        msg = String()
+        msg.data = color
+        self.self_color_pub.publish(msg)
+
+    def _publish_state_heartbeat(self) -> None:
+        """周期性发布当前颜色与约束状态，保障晚订阅者可见。"""
+        msg = String()
+        msg.data = self.latest_self_color
+        self.self_color_pub.publish(msg)
+
+        fire_allowed = True
+        if self.latest_heat_limit > 0.0:
+            fire_allowed = self.latest_shooter_heat < max(
+                0.0, self.latest_heat_limit - self.heat_lock_margin)
+        if self.latest_chassis_power_limit > 0.0 and self.latest_chassis_power > self.latest_chassis_power_limit:
+            fire_allowed = False
+
+        speed_scale = 1.0
+        if self.latest_chassis_power_limit > 0.0:
+            ratio = self.latest_chassis_power / self.latest_chassis_power_limit
+            if ratio >= self.power_hard_ratio:
+                speed_scale = self.min_speed_scale
+            elif ratio > self.power_high_ratio:
+                denom = max(1e-6, self.power_hard_ratio -
+                            self.power_high_ratio)
+                k = (ratio - self.power_high_ratio) / denom
+                speed_scale = 1.0 - k * (1.0 - self.min_speed_scale)
+
+        self._publish_constraints(fire_allowed, speed_scale)
 
     def _create_ros_message(self, cmd_id: int, data: Any, header: Header) -> Optional[PoseStamped]:
         """

@@ -33,7 +33,7 @@ setup(
     ],
 
     # 安装依赖
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'pyserial'],
     zip_safe=True,
 
     # 维护者信息
